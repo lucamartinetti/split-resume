@@ -5,7 +5,8 @@ A robust, resumable file splitting utility with integrity verification and flexi
 ## Features
 
 - **Resumable splitting**: Automatically detects existing chunks and continues from where it left off
-- **Integrity verification**: SHA256 checksum verification of the last chunk before resuming
+- **Integrity verification**: SHA1 checksum verification of the last chunk before resuming
+- **B2 cloud integration**: Upload chunks to Backblaze B2 with automatic hash verification and cleanup
 - **Flexible chunk management**: Warns about missing chunks but continues (allows moving chunks to free disk space)
 - **Split-compatible naming**: Uses standard split naming convention (aa, ab, ac, ...)
 - **Safe error handling**: Detects and reports partial/corrupted chunks without data loss
@@ -28,6 +29,7 @@ A robust, resumable file splitting utility with integrity verification and flexi
 - `-p, --prefix PREFIX`: Prefix for chunk filenames (default: `split_`)
 - `-s, --size SIZE_GB`: Chunk size in GB (default: `8`)
 - `-b, --buffer BUFFER_GB`: Safety buffer in GB (default: `2`)
+- `--upload-b2 BUCKET REMOTE_PATH`: Upload chunks to B2 after creation/verification
 - `-h, --help`: Show help message
 
 ## Examples
@@ -52,6 +54,15 @@ A robust, resumable file splitting utility with integrity verification and flexi
 # If splitting was interrupted, simply run the same command again
 ./split-resume.sh -p "backup_" -s 4 /data/file.img /backup/chunks/
 # Script will automatically detect existing chunks and continue
+```
+
+### B2 Cloud Upload
+```bash
+# Split and upload to B2 cloud storage
+./split-resume.sh --upload-b2 my-bucket "backups/vm-images/" /data/vm.img /tmp/chunks/
+
+# With custom chunk size and prefix
+./split-resume.sh -p "vm_" -s 2 --upload-b2 my-bucket "daily-backups/" /data/vm.img /tmp/chunks/
 ```
 
 ## Output
@@ -122,17 +133,44 @@ cat prefix_* > original-file
 split -d -a 2 --numeric-suffixes=0 /dev/null prefix_
 ```
 
+## B2 Cloud Storage Integration
+
+### Features
+- **Smart upload**: Checks if chunks already exist remotely with matching SHA1 hashes
+- **Automatic verification**: Compares local and remote hashes after upload
+- **Space saving**: Deletes local chunks after successful upload verification
+- **Resume friendly**: Works with existing resume functionality
+
+### Setup
+1. Install B2 CLI: `pip install b2` or from AUR on Arch Linux
+2. Authenticate: `backblaze-b2 account authorize`
+3. Use `--upload-b2` option with bucket name and remote path
+
+### Workflow
+```bash
+# The script will:
+# 1. Create chunk locally
+# 2. Check if chunk exists remotely with matching hash
+# 3. If hash matches: delete local chunk (already uploaded)
+# 4. If no match or missing: upload chunk to B2
+# 5. Verify upload by comparing hashes
+# 6. Delete local chunk after successful verification
+./split-resume.sh --upload-b2 my-bucket "path/" /large-file.img /tmp/
+```
+
 ## Requirements
 
 - Bash shell
-- Standard Unix utilities: `dd`, `stat`, `df`, `sha256sum`
+- Standard Unix utilities: `dd`, `stat`, `df`, `sha1sum`
 - Sufficient disk space for at least one chunk plus safety buffer
+- For B2 upload: B2 CLI installed and authenticated
 
 ## Technical Details
 
 - **Chunk size calculation**: Uses 1GB blocks for dd operations
-- **Hash algorithm**: SHA256 for integrity verification
+- **Hash algorithm**: SHA1 for both local integrity verification and B2 compatibility
 - **Suffix generation**: Compatible with GNU split naming convention
+- **B2 integration**: Uses B2 CLI for file operations and hash retrieval
 - **Error codes**: Script exits with non-zero status on errors
 
 ## Troubleshooting
@@ -143,6 +181,9 @@ split -d -a 2 --numeric-suffixes=0 /dev/null prefix_
 2. **"Not enough disk space"**: Increase available space or reduce chunk size
 3. **"Source file not found"**: Check file path and permissions
 4. **"Last chunk integrity verification failed"**: Remove corrupted chunk and restart
+5. **"B2 CLI not found"**: Install B2 CLI with `pip install b2` or from AUR
+6. **"B2 CLI not authenticated"**: Run `backblaze-b2 account authorize` first
+7. **"Upload verification failed"**: Check network connection and B2 service status
 
 ### Debug Information
 
