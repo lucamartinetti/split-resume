@@ -16,6 +16,7 @@ OPTIONS:
     -s, --size SIZE_GB               Chunk size in GB (default: 8)
     -b, --buffer BUFFER_GB           Safety buffer in GB (default: 2)
     --upload-b2 BUCKET REMOTE_PATH   Upload chunks to B2 after creation/verification
+    -x, --debug                      Enable debug mode (print all commands)
     -h, --help                       Show this help message
 
 B2 UPLOAD:
@@ -40,6 +41,7 @@ SAFETY_BUFFER_GB=2
 UPLOAD_B2=false
 B2_BUCKET=""
 B2_REMOTE_PATH=""
+B2_CLI="backblaze-b2"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             B2_BUCKET="$2"
             B2_REMOTE_PATH="$3"
             shift 3
+            ;;
+        -x|--debug)
+            set -x
+            shift
             ;;
         -h|--help)
             show_usage
@@ -183,19 +189,26 @@ get_available_space() {
 
 # Function to check B2 CLI availability and authentication
 check_b2_cli() {
-    # Check if B2 CLI is installed
-    if ! command -v backblaze-b2 >/dev/null 2>&1; then
+    # Auto-detect B2 CLI command
+    if command -v backblaze-b2 >/dev/null 2>&1; then
+        B2_CLI="backblaze-b2"
+    elif command -v b2 >/dev/null 2>&1; then
+        B2_CLI="b2"
+    elif command -v b2.exe >/dev/null 2>&1; then
+        B2_CLI="b2.exe"
+    else
         echo "ERROR: B2 CLI not found. Please install the Backblaze B2 CLI."
+        echo "Expected commands: backblaze-b2, b2, or b2.exe"
         exit 1
     fi
 
     # Check if B2 CLI is authenticated
-    if ! backblaze-b2 account info >/dev/null 2>&1; then
-        echo "ERROR: B2 CLI not authenticated. Please run 'backblaze-b2 account authorize' first."
+    if ! $B2_CLI account info >/dev/null 2>&1; then
+        echo "ERROR: B2 CLI not authenticated. Please run '$B2_CLI account authorize' first."
         exit 1
     fi
 
-    echo "B2 CLI is available and authenticated."
+    echo "B2 CLI is available and authenticated ($B2_CLI)."
 }
 
 # Function to get B2 file hash (SHA1) for a remote file
@@ -203,7 +216,7 @@ get_b2_file_hash() {
     local remote_file="$1"
 
     # Use B2 CLI to get file info and extract SHA1 hash
-    local file_info=$(backblaze-b2 file info "b2://$B2_BUCKET/$remote_file" 2>/dev/null)
+    local file_info=$($B2_CLI file info "b2://$B2_BUCKET/$remote_file" 2>/dev/null)
     if [ $? -eq 0 ]; then
         echo "$file_info" | grep -o '"sha1":"[^"]*"' | cut -d'"' -f4
     else
@@ -250,7 +263,7 @@ upload_chunk_to_b2() {
     echo "Uploading chunk to B2: $chunk_basename"
 
     # Upload the file to B2
-    if backblaze-b2 file upload "$B2_BUCKET" "$chunk_file" "$remote_file" >/dev/null 2>&1; then
+    if $B2_CLI file upload "$B2_BUCKET" "$chunk_file" "$remote_file" >/dev/null 2>&1; then
         echo "✓ Upload successful for $chunk_basename"
 
         # Verify the upload by comparing hashes

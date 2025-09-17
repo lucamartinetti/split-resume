@@ -143,8 +143,10 @@ split -d -a 2 --numeric-suffixes=0 /dev/null prefix_
 
 ### Setup
 1. Install B2 CLI: `pip install b2` or from AUR on Arch Linux
-2. Authenticate: `backblaze-b2 account authorize`
+2. Authenticate: `backblaze-b2 account authorize` (or `b2 account authorize`)
 3. Use `--upload-b2` option with bucket name and remote path
+
+**Note**: The script auto-detects the B2 CLI command (`backblaze-b2`, `b2`, or `b2.exe` on Windows)
 
 ### Workflow
 ```bash
@@ -182,7 +184,7 @@ split -d -a 2 --numeric-suffixes=0 /dev/null prefix_
 3. **"Source file not found"**: Check file path and permissions
 4. **"Last chunk integrity verification failed"**: Remove corrupted chunk and restart
 5. **"B2 CLI not found"**: Install B2 CLI with `pip install b2` or from AUR
-6. **"B2 CLI not authenticated"**: Run `backblaze-b2 account authorize` first
+6. **"B2 CLI not authenticated"**: Run `backblaze-b2 account authorize` (or `b2 account authorize`) first
 7. **"Upload verification failed"**: Check network connection and B2 service status
 
 ### Debug Information
