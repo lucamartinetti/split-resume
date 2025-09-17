@@ -30,6 +30,7 @@ A robust, resumable file splitting utility with integrity verification and flexi
 - `-s, --size SIZE_GB`: Chunk size in GB (default: `8`)
 - `-b, --buffer BUFFER_GB`: Safety buffer in GB (default: `2`)
 - `--upload-b2 BUCKET REMOTE_PATH`: Upload chunks to B2 after creation/verification
+- `-x, --debug`: Enable debug mode (print all commands)
 - `-h, --help`: Show help message
 
 ## Examples
@@ -63,6 +64,9 @@ A robust, resumable file splitting utility with integrity verification and flexi
 
 # With custom chunk size and prefix
 ./split-resume.sh -p "vm_" -s 2 --upload-b2 my-bucket "daily-backups/" /data/vm.img /tmp/chunks/
+
+# Upload mode processes ALL chunks for complete file
+./split-resume.sh -s 8 --upload-b2 my-bucket "media/" /data/large-file.img /storage/chunks/
 ```
 
 ## Output
@@ -148,17 +152,35 @@ split -d -a 2 --numeric-suffixes=0 /dev/null prefix_
 
 **Note**: The script auto-detects the B2 CLI command (`backblaze-b2`, `b2`, or `b2.exe` on Windows)
 
-### Workflow
+### Upload Mode Behavior
+When `--upload-b2` is used, the script operates in a special upload mode:
+
+**Processing Logic:**
+- Processes **ALL chunks** needed for the complete file (based on file size)
+- Works with existing chunks, missing chunks, or empty directories
+- Uses cached SHA1 hashes from `.sha1` files to avoid recomputation
+
+**Scenarios Handled:**
+1. **Existing chunks**: Verify against B2, upload if needed
+2. **Missing chunks with hash files**: Recreate chunk from source, then upload
+3. **No chunks or hash files**: Create chunk from scratch and upload
+4. **Hash verification**: Compare local vs remote SHA1 hashes before uploading
+
 ```bash
-# The script will:
-# 1. Create chunk locally
-# 2. Check if chunk exists remotely with matching hash
-# 3. If hash matches: delete local chunk (already uploaded)
-# 4. If no match or missing: upload chunk to B2
-# 5. Verify upload by comparing hashes
-# 6. Delete local chunk after successful verification
-./split-resume.sh --upload-b2 my-bucket "path/" /large-file.img /tmp/
+# Example: Upload all chunks for a 100GB file (13 chunks at 8GB each)
+./split-resume.sh -s 8 --upload-b2 my-bucket "backups/" /data/vm.img /chunks/
+
+# Will process chunks 0-12 regardless of what exists locally:
+# - Upload existing chunks that don't match remote
+# - Recreate missing chunks from hash files
+# - Create any completely missing chunks
+# - Delete local chunks after successful upload verification
 ```
+
+**Hash Caching:**
+- SHA1 hashes are cached in `.sha1` files (e.g., `chunk_aa.sha1`)
+- Hash files are **never deleted** for fast re-verification
+- Avoids expensive hash recomputation on large chunks
 
 ## Requirements
 

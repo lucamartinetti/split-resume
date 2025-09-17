@@ -162,9 +162,9 @@ find_last_chunk() {
     local last_chunk=-1
     local last_suffix=""
 
-    # Look for existing chunk files
+    # Look for existing chunk files (exclude .sha1 files)
     for file in "$OUTPUT_DIR"/${PREFIX}*; do
-        if [ -f "$file" ]; then
+        if [ -f "$file" ] && [[ "$file" != *.sha1 ]]; then
             # Extract suffix from filename
             local basename=$(basename "$file")
             local suffix=${basename#$PREFIX}
@@ -203,7 +203,7 @@ check_b2_cli() {
     fi
 
     # Check if B2 CLI is authenticated
-    if ! $B2_CLI account info >/dev/null 2>&1; then
+    if ! $B2_CLI account get >/dev/null 2>&1; then
         echo "ERROR: B2 CLI not authenticated. Please run '$B2_CLI account authorize' first."
         exit 1
     fi
@@ -218,10 +218,42 @@ get_b2_file_hash() {
     # Use B2 CLI to get file info and extract SHA1 hash
     local file_info=$($B2_CLI file info "b2://$B2_BUCKET/$remote_file" 2>/dev/null)
     if [ $? -eq 0 ]; then
-        echo "$file_info" | grep -o '"sha1":"[^"]*"' | cut -d'"' -f4
+        # First try to get contentSha1 (for regular files)
+        local sha1=$(echo "$file_info" | grep -o '"contentSha1": *"[^"]*"' | cut -d'"' -f4)
+
+        # If contentSha1 is "none", try large_file_sha1 (for large files)
+        if [ "$sha1" = "none" ] || [ -z "$sha1" ]; then
+            sha1=$(echo "$file_info" | grep -o '"large_file_sha1": *"[^"]*"' | cut -d'"' -f4)
+        fi
+
+        echo "$sha1"
     else
         echo ""
     fi
+}
+
+# Function to get or compute SHA1 hash for a local file
+get_local_hash() {
+    local chunk_file="$1"
+    local hash_file="${chunk_file}.sha1"
+
+    # Try to read from cached hash file first
+    if [ -f "$hash_file" ]; then
+        local cached_hash=$(cat "$hash_file" 2>/dev/null | cut -d' ' -f1)
+        if [ -n "$cached_hash" ] && [ ${#cached_hash} -eq 40 ]; then
+            echo "$cached_hash"
+            return 0
+        fi
+    fi
+
+    # Compute hash and save to cache file
+    echo "Computing SHA1 hash for $(basename "$chunk_file")..." >&2
+    local computed_hash=$(sha1sum "$chunk_file" | cut -d' ' -f1)
+
+    # Save hash to cache file (never delete this)
+    echo "$computed_hash  $(basename "$chunk_file")" > "$hash_file"
+
+    echo "$computed_hash"
 }
 
 # Function to verify chunk against B2 by comparing SHA1 hashes
@@ -239,8 +271,12 @@ verify_chunk_with_b2() {
         return 1
     fi
 
-    # Calculate local file SHA1 hash
-    local local_hash=$(sha1sum "$chunk_file" | cut -d' ' -f1)
+    # Get local file SHA1 hash (cached or computed)
+    local local_hash=$(get_local_hash "$chunk_file")
+
+    # Clean up hashes (remove any whitespace)
+    local_hash=$(echo "$local_hash" | tr -d ' \t\n\r')
+    remote_hash=$(echo "$remote_hash" | tr -d ' \t\n\r')
 
     # Compare hashes
     if [ "$local_hash" = "$remote_hash" ]; then
@@ -270,8 +306,8 @@ upload_chunk_to_b2() {
         if verify_chunk_with_b2 "$chunk_file"; then
             echo "✓ Upload verification successful for $chunk_basename"
 
-            # Delete local file after successful verification
-            echo "Deleting local chunk: $chunk_basename"
+            # Delete local file after successful verification (but keep .sha1 file)
+            echo "Deleting local chunk: $chunk_basename (keeping hash file)"
             rm -f "$chunk_file"
             return 0
         else
@@ -341,7 +377,7 @@ verify_last_chunk_integrity() {
     fi
 
     # Compare checksums
-    local original_hash=$(sha1sum "$chunk_file" | cut -d' ' -f1)
+    local original_hash=$(get_local_hash "$chunk_file")
     local recreated_hash=$(sha1sum "$temp_file" | cut -d' ' -f1)
 
     # Clean up temporary file
@@ -394,7 +430,19 @@ last_info=$(find_last_chunk)
 LAST_CHUNK_NUM=$(echo "$last_info" | cut -d: -f1)
 LAST_CHUNK_SUFFIX=$(echo "$last_info" | cut -d: -f2)
 
-if [ $LAST_CHUNK_NUM -eq -1 ]; then
+if [ "$UPLOAD_B2" = true ]; then
+    # For B2 upload mode, process all chunks that should exist based on file size
+    echo "B2 upload mode: Processing all chunks for complete file"
+    START_CHUNK=0
+    # Total chunks is based on file size, not existing chunks
+    TOTAL_CHUNKS=$(( (FILE_SIZE + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES ))
+    if [ $LAST_CHUNK_NUM -ne -1 ]; then
+        echo "Found existing chunks up to: ${PREFIX}${LAST_CHUNK_SUFFIX} (chunk number $LAST_CHUNK_NUM)"
+    else
+        echo "No existing chunks found"
+    fi
+    echo "Will process all $TOTAL_CHUNKS chunks needed for complete file"
+elif [ $LAST_CHUNK_NUM -eq -1 ]; then
     echo "No existing chunks found, starting from the beginning (chunk 0: aa)"
     START_CHUNK=0
 else
@@ -452,68 +500,133 @@ current_chunk=$START_CHUNK
 chunks_created=0
 
 while [ $current_chunk -lt $TOTAL_CHUNKS ]; do
-    # Check available space before creating each chunk
-    AVAILABLE_SPACE=$(get_available_space)
+    # Check available space before creating each chunk (skip for B2 upload mode)
+    if [ "$UPLOAD_B2" != true ]; then
+        AVAILABLE_SPACE=$(get_available_space)
 
-    if [ $AVAILABLE_SPACE -lt $((CHUNK_SIZE_BYTES + SAFETY_BUFFER_BYTES)) ]; then
-        echo ""
-        echo "Stopping: Not enough disk space for next chunk plus safety buffer"
-        echo "Available: $(($AVAILABLE_SPACE / 1024 / 1024 / 1024)) GB"
-        echo "Required: $(((CHUNK_SIZE_BYTES + SAFETY_BUFFER_BYTES) / 1024 / 1024 / 1024)) GB"
-        break
+        if [ $AVAILABLE_SPACE -lt $((CHUNK_SIZE_BYTES + SAFETY_BUFFER_BYTES)) ]; then
+            echo ""
+            echo "Stopping: Not enough disk space for next chunk plus safety buffer"
+            echo "Available: $(($AVAILABLE_SPACE / 1024 / 1024 / 1024)) GB"
+            echo "Required: $(((CHUNK_SIZE_BYTES + SAFETY_BUFFER_BYTES) / 1024 / 1024 / 1024)) GB"
+            break
+        fi
     fi
 
     # Generate the suffix for this chunk
     suffix=$(get_split_suffix $current_chunk)
     output_file="$OUTPUT_DIR/${PREFIX}$suffix"
 
-    # Check if this chunk already exists
-    if [ -f "$output_file" ]; then
-        echo "Chunk $suffix already exists, skipping..."
-        current_chunk=$((current_chunk + 1))
-        continue
-    fi
+    # Handle B2 upload mode vs normal chunk creation
+    if [ "$UPLOAD_B2" = true ]; then
+        # B2 upload mode: process existing chunks or recreate if hash file exists
+        if [ -f "$output_file" ]; then
+            echo "Processing existing chunk $suffix ($(($current_chunk + 1))/$TOTAL_CHUNKS)..."
 
-    # Calculate remaining bytes to avoid reading past end of file
-    remaining_bytes=$((FILE_SIZE - current_chunk * CHUNK_SIZE_BYTES))
-    if [ $remaining_bytes -le 0 ]; then
-        break
-    fi
-
-    # Determine how much to read (full chunk or remaining bytes)
-    if [ $remaining_bytes -ge $CHUNK_SIZE_BYTES ]; then
-        count_blocks=$CHUNK_SIZE_GB
-    else
-        # For the last partial chunk, calculate exact count
-        count_blocks=$(( (remaining_bytes + 1024*1024*1024 - 1) / (1024*1024*1024) ))
-    fi
-
-    echo "Creating chunk $suffix ($(($current_chunk + 1))/$TOTAL_CHUNKS)..."
-
-    # Extract the chunk using dd
-    if dd if="$SOURCE_FILE" of="$output_file" bs=1G skip=$((current_chunk * CHUNK_SIZE_GB)) count=$count_blocks 2>/dev/null; then
-        echo "Successfully created: $output_file"
-        chunks_created=$((chunks_created + 1))
-
-        # Handle B2 upload if enabled
-        if [ "$UPLOAD_B2" = true ]; then
             # First check if chunk already exists remotely with matching hash
             if verify_chunk_with_b2 "$output_file"; then
-                echo "Chunk already exists remotely with matching hash, deleting local copy"
+                echo "Chunk already exists remotely with matching hash, deleting local copy (keeping hash file)"
                 rm -f "$output_file"
             else
                 # Upload the chunk to B2
                 upload_chunk_to_b2 "$output_file"
             fi
+            chunks_created=$((chunks_created + 1))
+        else
+            # Chunk file doesn't exist - check if we need to create it
+            echo "Processing missing chunk $suffix ($(($current_chunk + 1))/$TOTAL_CHUNKS)..."
+
+            # Calculate remaining bytes to avoid reading past end of file
+            remaining_bytes=$((FILE_SIZE - current_chunk * CHUNK_SIZE_BYTES))
+            if [ $remaining_bytes -le 0 ]; then
+                echo "Chunk $suffix: beyond end of file, skipping"
+            else
+                # Check if we have a cached hash to compare with remote
+                should_create=true
+                if [ -f "${output_file}.sha1" ]; then
+                    echo "Found hash file for missing chunk, checking against remote..."
+                    cached_hash=$(cat "${output_file}.sha1" 2>/dev/null | cut -d' ' -f1)
+                    remote_hash=$(get_b2_file_hash "${B2_REMOTE_PATH}${suffix}")
+
+                    # Clean up hashes
+                    cached_hash=$(echo "$cached_hash" | tr -d ' \t\n\r')
+                    remote_hash=$(echo "$remote_hash" | tr -d ' \t\n\r')
+
+                    if [ -n "$remote_hash" ] && [ "$cached_hash" = "$remote_hash" ]; then
+                        echo "✓ Cached hash matches remote, chunk $suffix already uploaded correctly"
+                        should_create=false
+                        chunks_created=$((chunks_created + 1))
+                    fi
+                fi
+
+                if [ "$should_create" = true ]; then
+                    echo "Creating chunk $suffix for upload..."
+
+                    # Determine how much to read (full chunk or remaining bytes)
+                    if [ $remaining_bytes -ge $CHUNK_SIZE_BYTES ]; then
+                        count_blocks=$CHUNK_SIZE_GB
+                    else
+                        # For the last partial chunk, calculate exact count
+                        count_blocks=$(( (remaining_bytes + 1024*1024*1024 - 1) / (1024*1024*1024) ))
+                    fi
+
+                    # Create the chunk using dd
+                    if dd if="$SOURCE_FILE" of="$output_file" bs=1G skip=$((current_chunk * CHUNK_SIZE_GB)) count=$count_blocks 2>/dev/null; then
+                        echo "Successfully created: $output_file"
+
+                        # Check if chunk already exists remotely with matching hash
+                        if verify_chunk_with_b2 "$output_file"; then
+                            echo "Created chunk matches remote hash, deleting local copy (keeping hash file)"
+                            rm -f "$output_file"
+                        else
+                            # Upload the chunk to B2
+                            upload_chunk_to_b2 "$output_file"
+                        fi
+                        chunks_created=$((chunks_created + 1))
+                    else
+                        echo "Error creating chunk $suffix"
+                    fi
+                fi
+            fi
+        fi
+    else
+        # Normal chunk creation mode
+        # Check if this chunk already exists
+        if [ -f "$output_file" ]; then
+            echo "Chunk $suffix already exists, skipping..."
+            current_chunk=$((current_chunk + 1))
+            continue
         fi
 
-        # Show updated disk space
-        AVAILABLE_SPACE=$(get_available_space)
-        echo "Remaining space: $(($AVAILABLE_SPACE / 1024 / 1024 / 1024)) GB"
-    else
-        echo "Error creating chunk $suffix"
-        df -h "$OUTPUT_DIR"
-        break
+        # Calculate remaining bytes to avoid reading past end of file
+        remaining_bytes=$((FILE_SIZE - current_chunk * CHUNK_SIZE_BYTES))
+        if [ $remaining_bytes -le 0 ]; then
+            break
+        fi
+
+        # Determine how much to read (full chunk or remaining bytes)
+        if [ $remaining_bytes -ge $CHUNK_SIZE_BYTES ]; then
+            count_blocks=$CHUNK_SIZE_GB
+        else
+            # For the last partial chunk, calculate exact count
+            count_blocks=$(( (remaining_bytes + 1024*1024*1024 - 1) / (1024*1024*1024) ))
+        fi
+
+        echo "Creating chunk $suffix ($(($current_chunk + 1))/$TOTAL_CHUNKS)..."
+
+        # Extract the chunk using dd
+        if dd if="$SOURCE_FILE" of="$output_file" bs=1G skip=$((current_chunk * CHUNK_SIZE_GB)) count=$count_blocks 2>/dev/null; then
+            echo "Successfully created: $output_file"
+            chunks_created=$((chunks_created + 1))
+
+            # Show updated disk space
+            AVAILABLE_SPACE=$(get_available_space)
+            echo "Remaining space: $(($AVAILABLE_SPACE / 1024 / 1024 / 1024)) GB"
+        else
+            echo "Error creating chunk $suffix"
+            df -h "$OUTPUT_DIR"
+            break
+        fi
     fi
 
     current_chunk=$((current_chunk + 1))
